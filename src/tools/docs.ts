@@ -460,6 +460,7 @@ const APPEND_BLOCK_CANONICAL_TYPE_VALUES = [
   "frame",
   "edgeless_text",
   "note",
+  "note_ref",
 ] as const;
 type AppendBlockCanonicalType = typeof APPEND_BLOCK_CANONICAL_TYPE_VALUES[number];
 
@@ -576,6 +577,7 @@ const KNOWN_BLOCK_FLAVOURS = new Set<string>([
   "affine:frame",
   "affine:edgeless-text",
   "affine:note",
+  "affine:note-ref",
 ]);
 
 type AppendPlacement = {
@@ -597,6 +599,7 @@ type AppendBlockInput = {
   design?: string;
   reference?: string;
   refFlavour?: string;
+  displayMode?: "both" | "doc" | "edgeless";
   x?: number;
   y?: number;
   width?: number;
@@ -754,6 +757,7 @@ type NormalizedAppendBlockInput = {
   design: string;
   reference: string;
   refFlavour: string;
+  displayMode: "both" | "doc" | "edgeless";
   x: number;
   y: number;
   width: number;
@@ -2249,8 +2253,16 @@ export function registerDocTools(
       if (!normalized.refFlavour) {
         throw new Error("surface_ref blocks require 'refFlavour' (for example affine:frame).");
       }
+    } else if (normalized.type === "note_ref") {
+      if (!normalized.reference) {
+        throw new Error("note_ref blocks require 'reference' (the id of the affine:note to embed).");
+      }
     } else if ((raw.reference !== undefined || raw.refFlavour !== undefined) && normalized.strict) {
       throw new Error("The 'reference'/'refFlavour' fields can only be used with type='surface_ref'.");
+    }
+
+    if (raw.displayMode !== undefined && normalized.type !== "note" && normalized.strict) {
+      throw new Error("The 'displayMode' field can only be used with type='note'.");
     }
 
     if (normalized.type === "frame" || normalized.type === "edgeless_text" || normalized.type === "note" || normalized.type === "image") {
@@ -2375,6 +2387,7 @@ export function registerDocTools(
       design,
       reference,
       refFlavour,
+      displayMode: parsed.displayMode ?? "both",
       x,
       y,
       width,
@@ -3276,6 +3289,16 @@ export function registerDocTools(
         block.set("prop:comments", undefined);
         return { blockId, block, flavour: "affine:surface-ref" };
       }
+      case "note_ref": {
+        // AFFiNE fork block (spmp/AFFiNE): embeds an affine:note live inside page content, like the /note command
+        setSysFields(block, blockId, "affine:note-ref");
+        block.set("sys:parent", null);
+        block.set("sys:children", new Y.Array<string>());
+        block.set("prop:refBlockId", normalized.reference);
+        block.set("prop:refDocId", normalized.docId);
+        block.set("prop:showBorder", true);
+        return { blockId, block, flavour: "affine:note-ref" };
+      }
       case "frame": {
         setSysFields(block, blockId, "affine:frame");
         block.set("sys:parent", null);
@@ -3344,7 +3367,7 @@ export function registerDocTools(
         block.set("prop:index", nextIndex());
         block.set("prop:lockedBySelf", false);
         block.set("prop:hidden", false);
-        block.set("prop:displayMode", "both");
+        block.set("prop:displayMode", normalized.displayMode);
         const edgeless = new Y.Map<any>();
         const style = new Y.Map<any>();
         style.set("borderRadius", 8);
@@ -6401,6 +6424,10 @@ export function registerDocTools(
                   bounds: parseXywhString(raw.get("prop:xywh")),
                 }
               : {}),
+            ...(flavour === "affine:note-ref"
+              ? { refBlockId: asStringOrNull(raw.get("prop:refBlockId")), refDocId: asStringOrNull(raw.get("prop:refDocId")) }
+              : {}),
+            ...(flavour === "affine:note" ? { displayMode: asStringOrNull(raw.get("prop:displayMode")) } : {}),
           });
         }
 
@@ -7201,7 +7228,7 @@ export function registerDocTools(
         return: ReturnMode,
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
-        type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
+        type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note|note_ref. Legacy aliases remain supported."),
         text: RichTextInput.optional().describe('Block content as plain text or a delta array. For LinkedPage references, set insert to one ASCII space and pass the pageId in reference attributes; visible labels are resolved by AFFiNE.'),
         url: z.string()
           .refine(isSafeUrlInput, "url must be a safe absolute URL without control characters or embedded credentials")
@@ -7214,7 +7241,8 @@ export function registerDocTools(
           .describe("Override iframe src for embed_iframe"),
         html: z.string().optional().describe("Raw html for embed_html"),
         design: z.string().optional().describe("Design payload for embed_html"),
-        reference: z.string().optional().describe("Target id for surface_ref"),
+        reference: z.string().optional().describe("Target id for surface_ref; the embedded affine:note id for note_ref"),
+        displayMode: z.enum(["both", "doc", "edgeless"]).optional().describe("For type='note': where the note shows. 'edgeless' hides it from page view (as notes embedded with note_ref are). Default both."),
         refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
         x: z.number().int().optional().describe("X position on the edgeless canvas for frame/edgeless_text/note/image (default 0). Prefer ≥40px between sibling bounds; BlockSuite does not auto-arrange."),
         y: z.number().int().optional().describe("Y position on the edgeless canvas for frame/edgeless_text/note/image (default 0)."),
