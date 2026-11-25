@@ -130,21 +130,138 @@ export async function connectWorkspaceSocket(wsUrl: string, cookie?: string, bea
   });
 }
 
-export async function joinWorkspace(socket: WorkspaceSocket, workspaceId: string, clientVersion: string = DEFAULT_WS_CLIENT_VERSION) {
+// AFFiNE 0.27.5 (canary since 2026-09) replaced `space:join` with `space:join-batch`, which also has to name every
+// document the socket loads or pushes. Older servers only know `space:join`. Both joins are sent at once and the
+// one the server acknowledges decides the protocol for this socket; unknown events get no acknowledgement.
+const MIN_BATCH_WS_CLIENT_VERSION = "0.27.5";
+// Newer canaries also require a sync protocol version (1 or 2) in the batch join; older batch servers ignore it.
+const WS_PROTOCOL_VERSION = Number(process.env.AFFINE_WS_PROTOCOL_VERSION || 1);
+type SpaceProtocol = {
+  mode: "legacy" | "batch";
+  clientVersion: string;
+  joinedDocs: Set<string>;
+  // Batch protocol: whether a doc exists, learned from load-doc and successful pushes on this socket
+  docExists: Map<string, boolean>;
+};
+const socketProtocols = new WeakMap<object, Map<string, SpaceProtocol>>();
+
+function batchClientVersion(clientVersion: string): string {
+  const parse = (v: string) => v.split(/[.-]/).slice(0, 3).map((n) => Number.parseInt(n, 10) || 0);
+  const [a, b, c] = parse(clientVersion);
+  const [x, y, z] = parse(MIN_BATCH_WS_CLIENT_VERSION);
+  const atLeast = a !== x ? a > x : b !== y ? b > y : c >= z;
+  return /^\d+\.\d+\.\d+/.test(clientVersion) && atLeast ? clientVersion : MIN_BATCH_WS_CLIENT_VERSION;
+}
+
+function spaceProtocol(socket: WorkspaceSocket, workspaceId: string): SpaceProtocol | undefined {
+  return socketProtocols.get(socket as object)?.get(workspaceId);
+}
+
+function rememberProtocol(socket: WorkspaceSocket, workspaceId: string, protocol: SpaceProtocol) {
+  let byWorkspace = socketProtocols.get(socket as object);
+  if (!byWorkspace) {
+    byWorkspace = new Map();
+    socketProtocols.set(socket as object, byWorkspace);
+  }
+  byWorkspace.set(workspaceId, protocol);
+}
+
+function joinBatch(socket: WorkspaceSocket, workspaceId: string, docIds: string[], clientVersion: string, timeoutMs?: number) {
   return emitWithAck<void>(
+    socket,
+    'space:join-batch',
+    {
+      spaces: docIds.map((docId) => ({ spaceType: 'workspace', spaceId: workspaceId, docId })),
+      clientVersion,
+      protocolVersion: WS_PROTOCOL_VERSION,
+    },
+    (ack) => {
+      const message = ackErrorMessage(ack, "join failed");
+      if (message) throw new Error(message);
+      if (ack?.data?.success === false) throw new Error("join rejected: client version not accepted by the server");
+    },
+    timeoutMs,
+  );
+}
+
+export async function joinWorkspace(socket: WorkspaceSocket, workspaceId: string, clientVersion: string = DEFAULT_WS_CLIENT_VERSION) {
+  const legacy = emitWithAck<"legacy">(
     socket,
     'space:join',
     { spaceType: 'workspace', spaceId: workspaceId, clientVersion },
     (ack) => {
       const message = ackErrorMessage(ack, "join failed");
       if (message) throw new Error(message);
+      return "legacy";
     },
   );
+  const batchVersion = batchClientVersion(clientVersion);
+  const batch = joinBatch(socket, workspaceId, [workspaceId], batchVersion).then(() => "batch" as const);
+  // First successful acknowledgement wins; the other join is never answered by that server.
+  const mode = await Promise.any([legacy, batch]).catch((error: AggregateError) => {
+    const reasons = error.errors ?? [];
+    throw reasons.find((reason) => !/timeout after/.test(String(reason?.message))) ?? reasons[0] ?? error;
+  });
+  legacy.catch(() => undefined);
+  batch.catch(() => undefined);
+  rememberProtocol(socket, workspaceId, {
+    mode,
+    clientVersion: mode === "batch" ? batchVersion : clientVersion,
+    joinedDocs: new Set(mode === "batch" ? [workspaceId] : []),
+    docExists: new Map([[workspaceId, true]]),
+  });
+}
+
+/**
+ * Newer batch servers require each push to say whether it creates a document or updates an existing (joined) one.
+ * Legacy servers ignore the field. Unknown documents are looked up once per socket.
+ */
+async function pushIntent(socket: WorkspaceSocket, workspaceId: string, docId: string): Promise<"create" | "update"> {
+  const protocol = spaceProtocol(socket, workspaceId);
+  if (!protocol || protocol.mode !== "batch") return "update";
+  if (!protocol.docExists.has(docId)) await loadDocRaw(socket, workspaceId, docId);
+  return protocol.docExists.get(docId) === false ? "create" : "update";
+}
+
+function isNotInSpace(error: unknown): boolean {
+  const e = error as { name?: string; message?: string } | undefined;
+  return e?.name === "NOT_IN_SPACE" || /join in Space/i.test(String(e?.message ?? ""));
+}
+
+/**
+ * Batch protocol: the server drops a socket's doc subscriptions when the workspace permission generation changes
+ * (for example after a document is created). Rejoin the document and retry once.
+ */
+async function withDocRejoin<T>(socket: WorkspaceSocket, workspaceId: string, docId: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    const protocol = spaceProtocol(socket, workspaceId);
+    if (!protocol || protocol.mode !== "batch" || !isNotInSpace(error)) throw error;
+    protocol.joinedDocs.clear();
+    await ensureDocJoined(socket, workspaceId, docId);
+    return run();
+  }
+}
+
+/** Batch protocol: join a document before its first load or push on this socket. */
+async function ensureDocJoined(socket: WorkspaceSocket, workspaceId: string, docId: string) {
+  const protocol = spaceProtocol(socket, workspaceId);
+  if (!protocol || protocol.mode !== "batch" || protocol.joinedDocs.has(docId)) return;
+  await joinBatch(socket, workspaceId, [docId], protocol.clientVersion);
+  protocol.joinedDocs.add(docId);
 }
 
 type LoadDocResult = { missing?: string; state?: string; timestamp?: number; notFound?: true };
 
 async function loadDocRaw(socket: WorkspaceSocket, workspaceId: string, docId: string, timeoutMs?: number): Promise<LoadDocResult> {
+  await ensureDocJoined(socket, workspaceId, docId);
+  const result = await withDocRejoin(socket, workspaceId, docId, () => loadDocRawJoined(socket, workspaceId, docId, timeoutMs));
+  spaceProtocol(socket, workspaceId)?.docExists.set(docId, !result.notFound);
+  return result;
+}
+
+async function loadDocRawJoined(socket: WorkspaceSocket, workspaceId: string, docId: string, timeoutMs?: number): Promise<LoadDocResult> {
   return emitWithAck<LoadDocResult>(
     socket,
     'space:load-doc',
@@ -228,11 +345,13 @@ async function pushDocUpdateRaw(
   updateBase64: string,
   requireAcknowledgement = false,
 ): Promise<number> {
+  const intent = await pushIntent(socket, workspaceId, docId);
+  if (intent === "update") await ensureDocJoined(socket, workspaceId, docId);
   try {
-    return await emitWithAck<number>(
+    const timestamp = await withDocRejoin(socket, workspaceId, docId, () => emitWithAck<number>(
       socket,
       'space:push-doc-update',
-      { spaceType: 'workspace', spaceId: workspaceId, docId, update: updateBase64 },
+      { spaceType: 'workspace', spaceId: workspaceId, docId, update: updateBase64, intent },
       (ack) => {
         const message = ackErrorMessage(ack, "push-doc-update failed");
         if (message) throw new Error(message);
@@ -244,7 +363,9 @@ async function pushDocUpdateRaw(
           ? timestamp
           : Date.now();
       },
-    );
+    ));
+    spaceProtocol(socket, workspaceId)?.docExists.set(docId, true);
+    return timestamp;
   } catch (error) {
     if (requireAcknowledgement && error instanceof SocketAckTimeout && error.message.startsWith("space:push-doc-update timeout after ")) {
       throw uncertainWriteAcknowledgement(docId);
@@ -473,6 +594,7 @@ export function deleteDoc(
       const acknowledgedBeforeRead = acknowledged;
 
       try {
+        await ensureDocJoined(socket, payload.spaceId, payload.docId);
         const absent = await emitWithAck<boolean>(
           socket,
           'space:load-doc',

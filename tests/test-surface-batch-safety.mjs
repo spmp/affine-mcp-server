@@ -57,6 +57,7 @@ wss.on("connection", socket => {
     const start = packet.indexOf("["), ackId = packet.slice(2, start);
     const [event, payload = {}] = JSON.parse(packet.slice(start));
     let ack;
+    if (event === "space:join-batch") return; // legacy server: unknown event, never acknowledged
     if (event === "space:join") ack = undefined;
     else if (event === "space:load-doc") {
       const document = docs.get(payload.docId);

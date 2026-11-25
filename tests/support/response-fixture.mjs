@@ -93,6 +93,7 @@ export async function createResponseFixture({ register = registerDocTools, coord
       const index = packet.indexOf('['), ackId = packet.slice(2, index);
       const [event, payload = {}] = JSON.parse(packet.slice(index));
       let ack;
+      if (event === 'space:join-batch') return; // legacy server: unknown event, never acknowledged
       if (event === 'space:join') ack = undefined;
       else if (event === 'space:load-doc') {
         const doc = docs.get(payload.docId);
