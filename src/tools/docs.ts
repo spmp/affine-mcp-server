@@ -5229,7 +5229,14 @@ export function registerDocTools(
     creatorId: string,
   ): Promise<void> {
     const contentUpdateBase64 = Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64");
+    // Newer AFFiNE (create_doc intent) only stores a new page's content once the workspace page list
+    // contains it, so the page-list entry is written first.
+    let metadataUpdateBase64: string | undefined;
     try {
+      metadataUpdateBase64 = (await buildWorkspacePageMetadataUpdate(socket, workspaceId, docId, title)) ?? undefined;
+      if (metadataUpdateBase64) {
+        await pushForDocumentCreation(socket, workspaceId, workspaceId, metadataUpdateBase64);
+      }
       await pushForDocumentCreation(socket, workspaceId, docId, contentUpdateBase64);
     } catch (error) {
       await reconcileDocumentCreation(socket, {
@@ -5238,23 +5245,14 @@ export function registerDocTools(
         title,
         contentUpdateBase64,
         creatorId,
+        metadataUpdateBase64,
         stage: "content",
         cause: error,
       });
       return;
     }
 
-    let metadataUpdateBase64: string | undefined;
     try {
-      metadataUpdateBase64 = (await buildWorkspacePageMetadataUpdate(
-        socket,
-        workspaceId,
-        docId,
-        title,
-      )) ?? undefined;
-      if (metadataUpdateBase64) {
-        await pushForDocumentCreation(socket, workspaceId, workspaceId, metadataUpdateBase64);
-      }
       await ensureDocumentCreator(socket, workspaceId, docId, creatorId, creatorTransport);
     } catch (error) {
       await reconcileDocumentCreation(socket, {
